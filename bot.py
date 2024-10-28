@@ -29,6 +29,7 @@ from googleapiclient.discovery import build
 from googleapiclient.discovery import build
 from dateparser.search import search_dates
 
+from typing import Optional
 
 # Load environment variables from .env file
 load_dotenv()
@@ -107,18 +108,29 @@ def get_calendar_service():
 def get_application():
     return application
 
+# Global variables
+USER_CHAT_ID: Optional[int] = None
+application = None
+
 # Command: /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('Hi! I am your Productivity Bot. How can I assist you today?')
+    """Store user's chat ID and send welcome message."""
+    global USER_CHAT_ID
+    USER_CHAT_ID = update.effective_chat.id
+    logger.info(f"Chat ID set to: {USER_CHAT_ID}")
+    await update.message.reply_text(
+        "👋 Hi! I'm your Productivity Bot.\n"
+        "I'll help you track your habits and tasks!\n\n"
+        "Use /help to see available commands."
+    )
 
 # First, add the natural language parsing function
 def extract_duration(text):
-    # Define regex patterns for duration
+    """Extract duration in minutes from text."""
     duration_patterns = [
-        r'for (\d+(?:\.\d+)?)\s*(hours|hour|hrs|hr|minutes|minute|mins|min)',
-        r'in (\d+(?:\.\d+)?)\s*(hours|hour|hrs|hr|minutes|minute|mins|min)',
-        r'lasting (\d+(?:\.\d+)?)\s*(hours|hour|hrs|hr|minutes|minute|mins|min)',
-        r'(\d+(?:\.\d+)?)\s*(hours|hour|hrs|hr|minutes|minute|mins|min)\s*(long|duration)?'
+        r'for (\d+(?:\.\d+)?)\s*(hours?|hrs?|h|minutes?|mins?|m)',
+        r'(\d+(?:\.\d+)?)\s*(hours?|hrs?|h|minutes?|mins?|m)\s*(long|duration)?',
+        r'lasting (\d+(?:\.\d+)?)\s*(hours?|hrs?|h|minutes?|mins?|m)',
     ]
     
     for pattern in duration_patterns:
@@ -126,11 +138,14 @@ def extract_duration(text):
         if match:
             num = float(match.group(1))
             unit = match.group(2).lower()
-            if 'hour' in unit or 'hr' in unit:
-                return int(num * 60)  # Convert hours to minutes
-            elif 'minute' in unit or 'min' in unit:
+            
+            # Convert to minutes
+            if unit.startswith(('hour', 'hr', 'h')):
+                return int(num * 60)
+            elif unit.startswith(('min', 'm')):
                 return int(num)
-    return None  # Duration not found
+                
+    return 60  # Default duration in minutes
 
 async def error_handler(update, context):
     logger.error(msg="Exception while handling an update:", exc_info=context.error)
@@ -138,58 +153,87 @@ async def error_handler(update, context):
     await update.message.reply_text("An unexpected error occurred. Please try again later.")
 
 def parse_natural_language(text):
+    """
+    Parse natural language input for event details.
+    Returns: (event_description, event_datetime, duration_minutes, ambiguous)
+    """
     duration_minutes = 60  # Default duration
     ambiguous = False
+    now = datetime.now()
 
-    # Extract dates and times with settings to prefer future dates
-    date_times = search_dates(text, languages=['en'], settings={'PREFER_DATES_FROM': 'future'})
-    event_datetime = None
-    if date_times:
-        # Choose the first date/time that is in the future
-        now = datetime.now()
-        future_dates = [(dt_text, dt) for dt_text, dt in date_times if dt > now]
-        if future_dates:
-            dt_text, event_datetime = future_dates[0]
-            if len(future_dates) > 1:
-                ambiguous = True  # Multiple future date/times found
-        else:
-            dt_text, event_datetime = date_times[0]
-            ambiguous = True  # All dates are in the past
-    else:
-        ambiguous = True  # No date/time found
-
-    # Extract duration
+    # First extract duration to prevent interference with date parsing
     extracted_duration = extract_duration(text)
     if extracted_duration:
         duration_minutes = extracted_duration
 
-    # Remove date/time and duration phrases from text
+    # Remove duration phrases from text before date parsing
+    duration_patterns = [
+        r'for \d+(?:\.\d+)?\s*(hours?|hrs?|minutes?|mins?)',
+        r'in \d+(?:\.\d+)?\s*(hours?|hrs?|minutes?|mins?)',
+        r'lasting \d+(?:\.\d+)?\s*(hours?|hrs?|minutes?|mins?)',
+        r'\d+(?:\.\d+)?\s*(hours?|hrs?|minutes?|mins?)\s*(long|duration)?'
+    ]
     text_cleaned = text
-    if date_times:
-        for dt_text, _ in date_times:
+    for pattern in duration_patterns:
+        text_cleaned = re.sub(pattern, '', text_cleaned, flags=re.IGNORECASE)
+
+    # Check for "now" explicitly
+    now_patterns = [r'\bnow\b', r'\bright now\b', r'\bimmediately\b']
+    is_now = any(re.search(pattern, text_cleaned, re.IGNORECASE) for pattern in now_patterns)
+    
+    if is_now:
+        # Remove "now" related words from text
+        for pattern in now_patterns:
+            text_cleaned = re.sub(pattern, '', text_cleaned, flags=re.IGNORECASE)
+        event_datetime = now
+    else:
+        # Extract dates and times for non-"now" cases
+        date_times = search_dates(text_cleaned, languages=['en'], settings={
+            'PREFER_DATES_FROM': 'future',
+            'RELATIVE_BASE': now
+        })
+        
+        if date_times:
+            # Filter future dates
+            future_dates = [(dt_text, dt) for dt_text, dt in date_times if dt > now]
+            if future_dates:
+                dt_text, event_datetime = future_dates[0]
+                if len(future_dates) > 1:
+                    ambiguous = True  # Multiple future dates found
+            else:
+                dt_text, event_datetime = date_times[0]
+                ambiguous = True  # All dates are in the past
+                
+            # Remove the date/time text
             text_cleaned = re.sub(re.escape(dt_text), '', text_cleaned, flags=re.IGNORECASE)
+        else:
+            event_datetime = now  # Default to now if no date/time found
+            ambiguous = True
 
-    duration_phrases = re.findall(r'(for|in|lasting)?\s*\d+(?:\.\d+)?\s*(hours?|hrs?|minutes?|mins?)', text_cleaned, re.IGNORECASE)
-    for phrase in duration_phrases:
-        phrase_text = ' '.join(phrase).strip()
-        text_cleaned = re.sub(re.escape(phrase_text), '', text_cleaned, flags=re.IGNORECASE)
-
-    # Clean up extra spaces and punctuation
+    # Clean up the event description
     event_description = re.sub(r'\s+', ' ', text_cleaned).strip().strip('.,')
+    
+    # Additional cleanup for common artifacts
+    event_description = re.sub(r'\b(set|schedule)\b', '', event_description, flags=re.IGNORECASE)
+    event_description = re.sub(r'\s+', ' ', event_description).strip()
 
+    # Mark as ambiguous if description is too short
     if not event_description or len(event_description.split()) < 2:
-        ambiguous = True  # Description is too short
+        ambiguous = True
 
+    logger.debug(f"Parsed event: '{event_description}' at {event_datetime} for {duration_minutes} minutes (ambiguous: {ambiguous})")
+    
     return event_description, event_datetime, duration_minutes, ambiguous
 
 # Add the event creation function
 async def create_event(update, context, event_description, event_datetime, duration_minutes):
+    """Create an event and schedule its completion check."""
     # Localize datetime
     local_tz = pytz.timezone('Asia/Kuala_Lumpur')  # Replace with your timezone
     event_datetime = local_tz.localize(event_datetime)
 
-    # Create Google Calendar event
     try:
+        # Create Google Calendar event
         service = get_calendar_service()
         event = {
             'summary': event_description,
@@ -205,43 +249,44 @@ async def create_event(update, context, event_description, event_datetime, durat
         created_event = service.events().insert(calendarId='primary', body=event).execute()
         event_id = created_event.get('id')
 
-    except Exception as e:
-        logger.error(f"Error creating calendar event: {e}")
-        await update.message.reply_text("❌ An error occurred while creating the event.")
-        return
-
-    # Log the event in Google Sheets
-    try:
+        # Log the event in Google Sheets
         sheets_service = get_sheets_service()
-        values = [[event_description, 'Pending', event_datetime.strftime('%Y-%m-%d'), event_datetime.strftime('%H:%M'), event_id]]
-        body = {'values': values}
-        result = sheets_service.spreadsheets().values().append(
+        values = [[
+            event_description, 
+            'Pending', 
+            event_datetime.strftime('%Y-%m-%d'), 
+            event_datetime.strftime('%H:%M'),
+            event_id
+        ]]
+        
+        sheets_service.spreadsheets().values().append(
             spreadsheetId=SPREADSHEET_ID,
             range='Events!A:E',
             valueInputOption='RAW',
-            body=body
+            body={'values': values}
         ).execute()
 
+        # Schedule the completion check
+        reminder_time = event_datetime + timedelta(minutes=duration_minutes)
+        scheduler.add_job(
+            send_event_check,
+            trigger='date',
+            run_date=reminder_time,
+            args=[update.effective_chat.id, event_description, event_id],
+            id=event_id
+        )
+
+        # Send confirmation
+        await update.message.reply_text(
+            f"✅ Event '{event_description}' has been created.\n"
+            f"📅 Date and Time: {event_datetime.strftime('%Y-%m-%d %H:%M')} - "
+            f"{(event_datetime + timedelta(minutes=duration_minutes)).strftime('%H:%M')}\n"
+            f" Duration: {duration_minutes} minutes"
+        )
+
     except Exception as e:
-        logger.error(f"Error writing to Google Sheets: {e}")
-        await update.message.reply_text("❌ An error occurred while writing to Google Sheets.")
-        return
-
-    await update.message.reply_text(
-        f"✅ Event '{event_description}' has been created in your Google Calendar.\n"
-        f"📅 Date and Time: {event_datetime.strftime('%Y-%m-%d %H:%M')} - {(event_datetime + timedelta(minutes=duration_minutes)).strftime('%H:%M')}\n"
-        f"⏰ Duration: {duration_minutes} minutes"
-    )
-
-    # Schedule a reminder to check if the event was completed
-    reminder_time = event_datetime + timedelta(minutes=duration_minutes)
-    scheduler.add_job(
-        send_event_check,
-        trigger='date',
-        run_date=reminder_time,
-        args=[update.effective_chat.id, event_description, event_id],
-        id=event_id
-    )
+        logger.error(f"Error creating event: {e}")
+        await update.message.reply_text("❌ An error occurred while creating the event.")
 
 # Add the natural language handler
 async def handle_natural_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -378,6 +423,7 @@ async def set_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Function to send event completion check
 async def send_event_check(chat_id, event_description, event_id):
+    """Send a message to check if an event was completed."""
     keyboard = [
         [
             InlineKeyboardButton("✅ Yes", callback_data=f"event_done|{event_id}"),
@@ -385,47 +431,101 @@ async def send_event_check(chat_id, event_description, event_id):
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await application.bot.send_message(
-        chat_id=chat_id,
-        text=f"Did you complete the event '{event_description}'?",
-        reply_markup=reply_markup
-    )
-
-# Callback handler for event completion
-async def handle_event_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data.split('|')
-    if len(data) != 2:
-        await query.edit_message_text("❌ Invalid response.")
-        return
-
-    status, event_id = data
-
+    
     try:
-        # Get Sheets service
+        await application.bot.send_message(
+            chat_id=chat_id,
+            text=f"⏰ Your event '{event_description}' has ended.\nDid you complete it?",
+            reply_markup=reply_markup
+        )
+        
+        # Schedule auto-update after 1 hour if no response
+        auto_update_time = datetime.now() + timedelta(hours=1)
+        scheduler.add_job(
+            auto_update_event_status,
+            trigger='date',
+            run_date=auto_update_time,
+            args=[event_id],
+            id=f"auto_update_{event_id}"
+        )
+    except Exception as e:
+        logger.error(f"Error sending event check: {e}")
+
+async def auto_update_event_status(event_id):
+    """Automatically update event status to 'Missed' if no response after timeout."""
+    try:
         sheets_service = get_sheets_service()
 
-        # Read all data from Events sheet
+        # Read current data
         result = sheets_service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID,
-            range='Events!A:E'  # Adjust range based on your sheet columns
+            range='Events!A:E'
         ).execute()
         values = result.get('values', [])
 
-        # Validate sheet data
-        if not values or len(values) < 2:  # Check for headers and at least one row
+        if not values or len(values) < 2:
+            logger.warning("No events found in sheet for auto-update")
+            return
+
+        # Find the event
+        headers = values[0]
+        events = [dict(zip(headers, row)) for row in values[1:]]
+        
+        row_number = None
+        for idx, record in enumerate(events, start=2):
+            if record.get('Event ID') == event_id and record.get('Status') == 'Pending':
+                row_number = idx
+                break
+
+        if row_number:
+            # Update to 'Missed' if still pending
+            sheets_service.spreadsheets().values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f'Events!B{row_number}',
+                valueInputOption='RAW',
+                body={'values': [['Missed']]}
+            ).execute()
+            logger.info(f"Event {event_id} auto-updated to 'Missed' due to no response")
+
+    except Exception as e:
+        logger.error(f"Error in auto_update_event_status: {e}")
+
+async def handle_event_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle user's response to event completion check."""
+    query = update.callback_query
+    await query.answer()
+    
+    try:
+        # Parse callback data
+        data = query.data.split('|')
+        if len(data) != 2:
+            await query.edit_message_text("❌ Invalid response.")
+            return
+
+        status, event_id = data
+
+        # Get Sheets service
+        sheets_service = get_sheets_service()
+
+        # Read current data
+        result = sheets_service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range='Events!A:E'
+        ).execute()
+        values = result.get('values', [])
+
+        if not values or len(values) < 2:
             await query.edit_message_text("❌ No events found in the sheet.")
             return
 
-        # Convert sheet data to dictionary format
+        # Process sheet data
         headers = values[0]
         events = [dict(zip(headers, row)) for row in values[1:]]
 
-        # Find matching event row
+        # Find the event
         row_number = None
         event_description = None
-        for idx, record in enumerate(events, start=2):  # Start from 2 to account for header row
+        for idx, record in enumerate(events, start=2):
             if record.get('Event ID') == event_id:
                 row_number = idx
                 event_description = record.get('Event Description')
@@ -435,10 +535,10 @@ async def handle_event_response(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text("❌ Event not found in the sheet.")
             return
 
-        # Update status based on callback
+        # Update status
         new_status = 'Done' if status == "event_done" else 'Missed'
         
-        # Update the cell using Sheets API
+        # Update the sheet
         sheets_service.spreadsheets().values().update(
             spreadsheetId=SPREADSHEET_ID,
             range=f'Events!B{row_number}',  # Status column
@@ -446,7 +546,13 @@ async def handle_event_response(update: Update, context: ContextTypes.DEFAULT_TY
             body={'values': [[new_status]]}
         ).execute()
 
-        # Send confirmation message
+        # Cancel auto-update job if it exists
+        try:
+            scheduler.remove_job(f"auto_update_{event_id}")
+        except Exception:
+            pass  # Job might not exist, that's okay
+
+        # Send confirmation
         emoji = "✅" if status == "event_done" else "❌"
         await query.edit_message_text(
             f"{emoji} Event '{event_description}' marked as {new_status}!"
@@ -456,110 +562,179 @@ async def handle_event_response(update: Update, context: ContextTypes.DEFAULT_TY
         logger.error(f"Error handling event response: {e}")
         await query.edit_message_text("❌ An error occurred while updating the event status.")
 
-# Command: /settask
+# Update the set_task function and its handlers
 async def set_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Please enter the task details in the following format:\n"
-        "/settask [Task Description] | [Due Date YYYY-MM-DD HH:MM]"
-        "\n\nExample: /settask Finish report | 2024-10-25 17:00"
-    )
-
-# Handler for /settask
-async def handle_set_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle the /settask command."""
     text = update.message.text
     pattern = r'^/settask\s+(.+?)\s*\|\s*(.+?)\s*$'
     match = re.match(pattern, text, re.IGNORECASE)
+    
     if not match:
         await update.message.reply_text(
             "❌ Invalid format. Please use:\n"
-            "/settask [Task Description] | [Due Date YYYY-MM-DD HH:MM]"
-            "\n\nExample: /settask Finish report | 2024-10-25 17:00"
+            "/settask [Task Description] | [Due Date]\n\n"
+            "Examples:\n"
+            "• /settask Complete project report | tomorrow 5pm\n"
+            "• /settask Buy groceries | 2024-03-15 14:00\n"
+            "• /settask Call client | next monday 10am"
         )
         return
 
-    task_description = match.group(1)
-    due_date_str = match.group(2)
-    due_date = dateparser.parse(due_date_str)
-
-    if not due_date:
-        await update.message.reply_text("❌ Could not parse the due date and time. Please ensure it's in a recognizable format.")
-        return
-
-    # Localize datetime
-    local_tz = pytz.timezone('Asia/Kuala_Lumpur')  # Replace with your timezone
-    due_date = local_tz.localize(due_date)
-
-    # Log the task in Google Sheets
+    task_description = match.group(1).strip()
+    due_date_str = match.group(2).strip()
+    
+    # Parse the due date
     try:
-        sheet = get_google_sheet('Tasks')  # Ensure you have a 'Tasks' sheet
-        sheet.append_row([task_description, 'Pending', due_date.strftime('%Y-%m-%d %H:%M'), ''])
-
-        await update.message.reply_text(
-            f"✅ Task '{task_description}' has been added with a due date of {due_date.strftime('%Y-%m-%d %H:%M')}."
+        due_date = dateparser.parse(
+            due_date_str,
+            settings={
+                'PREFER_DATES_FROM': 'future',
+                'TIMEZONE': 'Asia/Kuala_Lumpur',
+                'RETURN_AS_TIMEZONE_AWARE': True
+            }
         )
+        
+        if not due_date:
+            await update.message.reply_text(
+                "❌ Could not understand the due date format.\n"
+                "Please use a clear date and time format."
+            )
+            return
+            
+        # Get current time in local timezone
+        local_tz = pytz.timezone('Asia/Kuala_Lumpur')
+        now = datetime.now(local_tz)
+        
+        # Ensure due date is in the future
+        if due_date <= now:
+            await update.message.reply_text(
+                "❌ Due date must be in the future."
+            )
+            return
 
-        # Schedule a reminder before the due date
-        reminder_time = due_date - timedelta(minutes=30)  # 30 minutes before
-        scheduler.add_job(
-            send_task_reminder,
-            trigger='date',
-            run_date=reminder_time,
-            args=[update.effective_chat.id, task_description, due_date],
-            id=f"task_reminder_{task_description}_{due_date.strftime('%Y%m%d%H%M')}"
+        # Add to Google Sheets
+        sheets_service = get_sheets_service()
+        values = [[
+            task_description,
+            'Pending',
+            due_date.strftime('%Y-%m-%d %H:%M'),
+            now.strftime('%Y-%m-%d %H:%M')
+        ]]
+
+        sheets_service.spreadsheets().values().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range='Tasks!A:D',
+            valueInputOption='RAW',
+            body={'values': values}
+        ).execute()
+
+        # Schedule a reminder (30 minutes before due date)
+        reminder_time = due_date - timedelta(minutes=30)
+        if reminder_time > now:
+            scheduler.add_job(
+                send_task_reminder,
+                'date',
+                run_date=reminder_time,
+                args=[update.effective_chat.id, task_description, due_date],
+                id=f"task_reminder_{task_description}_{due_date.strftime('%Y%m%d%H%M')}"
+            )
+
+        # Send confirmation
+        await update.message.reply_text(
+            f"✅ Task added successfully!\n\n"
+            f"📝 Task: {task_description}\n"
+            f"⏰ Due: {due_date.strftime('%Y-%m-%d %H:%M')}\n"
+            f"🔔 Reminder set for: {reminder_time.strftime('%Y-%m-%d %H:%M')}"
         )
 
     except Exception as e:
-        logger.error(f"Error logging task: {e}")
-        await update.message.reply_text("❌ An error occurred while adding the task.")
+        logger.error(f"Error in set_task: {e}")
+        await update.message.reply_text(
+            "❌ An error occurred while adding the task.\n"
+            "Please try again or contact support if the issue persists."
+        )
 
-# Function to send task reminder
-async def send_task_reminder(chat_id, task_description, due_date):
+async def send_task_reminder(chat_id: int, task_description: str, due_date: datetime):
+    """Send a reminder for a task that's due soon."""
     keyboard = [
         [
-            InlineKeyboardButton("✅ Completed", callback_data=f"task_done|{task_description}|{due_date.strftime('%Y-%m-%d %H:%M')}"),
-            InlineKeyboardButton("❌ Not Yet", callback_data=f"task_not_done|{task_description}|{due_date.strftime('%Y-%m-%d %H:%M')}")
+            InlineKeyboardButton("✅ Done", callback_data=f"task_done|{task_description}"),
+            InlineKeyboardButton("⏰ Snooze", callback_data=f"task_snooze|{task_description}")
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await application.bot.send_message(
-        chat_id=chat_id,
-        text=f"⏰ Reminder: Task '{task_description}' is due at {due_date.strftime('%H:%M')}. Have you completed it?",
-        reply_markup=reply_markup
-    )
+    
+    try:
+        await application.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"🔔 Reminder: Task due in 30 minutes!\n\n"
+                f"📝 Task: {task_description}\n"
+                f"⏰ Due at: {due_date.strftime('%H:%M')}"
+            ),
+            reply_markup=reply_markup
+        )
+    except Exception as e:
+        logger.error(f"Error sending task reminder: {e}")
 
-# Callback handler for task completion
 async def handle_task_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle user's response to task completion check."""
     query = update.callback_query
     await query.answer()
-    data = query.data.split('|')
-    if len(data) != 3:
-        await query.edit_message_text("❌ Invalid response.")
-        return
-
-    status, task_description, due_date_str = data
-    sheet = get_google_sheet('Tasks')
-
-    # Find the task row
-    tasks = sheet.get_all_records()
-    row_number = None
-    for idx, record in enumerate(tasks, start=2):
-        if (record['Task Description'].lower() == task_description.lower() and
-                record['Due Date'] == due_date_str):
-            row_number = idx
-            break
-
-    if not row_number:
-        await query.edit_message_text("❌ Task not found in the sheet.")
-        return
-
-    if status == "task_done":
-        sheet.update_cell(row_number, 2, 'Done')
-        await query.edit_message_text(f"✅ Task '{task_description}' marked as Done!")
-    elif status == "task_not_done":
-        sheet.update_cell(row_number, 2, 'Pending')
-        await query.edit_message_text(f"⏳ Task '{task_description}' remains Pending.")
-    else:
-        await query.edit_message_text("❌ Unknown status.")
+    
+    try:
+        action, task_description = query.data.split('|')
+        
+        if action == "task_done":
+            # Update task status in sheets
+            sheets_service = get_sheets_service()
+            result = sheets_service.spreadsheets().values().get(
+                spreadsheetId=SPREADSHEET_ID,
+                range='Tasks!A:D'
+            ).execute()
+            
+            values = result.get('values', [])
+            row_number = None
+            
+            for idx, row in enumerate(values[1:], start=2):
+                if row[0] == task_description and row[1] == 'Pending':
+                    row_number = idx
+                    break
+            
+            if row_number:
+                sheets_service.spreadsheets().values().update(
+                    spreadsheetId=SPREADSHEET_ID,
+                    range=f'Tasks!B{row_number}',
+                    valueInputOption='RAW',
+                    body={'values': [['Done']]}
+                ).execute()
+                
+                await query.edit_message_text(
+                    f"✅ Task '{task_description}' marked as Done!"
+                )
+            else:
+                await query.edit_message_text(
+                    f"❌ Could not find pending task: {task_description}"
+                )
+                
+        elif action == "task_snooze":
+            # Snooze for 15 minutes
+            snooze_time = datetime.now(pytz.timezone('Asia/Kuala_Lumpur')) + timedelta(minutes=15)
+            scheduler.add_job(
+                send_task_reminder,
+                'date',
+                run_date=snooze_time,
+                args=[update.effective_chat.id, task_description, snooze_time + timedelta(minutes=30)],
+                id=f"task_reminder_{task_description}_{snooze_time.strftime('%Y%m%d%H%M')}"
+            )
+            
+            await query.edit_message_text(
+                f"⏰ Reminder snoozed for 15 minutes"
+            )
+            
+    except Exception as e:
+        logger.error(f"Error handling task response: {e}")
+        await query.edit_message_text("❌ An error occurred while processing your response.")
 
 # Command: /tasktoday
 async def task_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -583,21 +758,42 @@ async def task_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Command: /eventtoday
 async def event_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    sheet = get_google_sheet('Events')
-    events = sheet.get_all_records()
-    today_str = datetime.now().strftime('%Y-%m-%d')
-    todays_events = [event for event in events if event['Event Date'] == today_str and event['Status'] != 'Done']
+    service = get_calendar_service()
 
-    if not todays_events:
+    # Define the time range for today in your local timezone
+    local_tz = pytz.timezone('Asia/Kuala_Lumpur')  # Replace with your timezone if different
+    now = datetime.now(local_tz)
+    start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_of_day = start_of_day + timedelta(days=1)
+
+    # Convert to RFC3339 timestamp format with timezone offset
+    time_min = start_of_day.isoformat()
+    time_max = end_of_day.isoformat()
+
+    # Fetch events from Google Calendar within the specified time range
+    events_result = service.events().list(
+        calendarId='primary',
+        timeMin=time_min,
+        timeMax=time_max,
+        singleEvents=True,
+        orderBy='startTime'
+    ).execute()
+
+    events = events_result.get('items', [])
+
+    if not events:
         await update.message.reply_text("🎉 You have no events for today! Enjoy your day!")
         return
 
-    # Sort events by time
-    todays_events.sort(key=lambda x: x['Event Time'])
-
     message = "📅 **Today's Events:**\n"
-    for idx, event in enumerate(todays_events, start=1):
-        message += f"{idx}. {event['Event Description']} at {event['Event Time']}\n"
+    for idx, event in enumerate(events, start=1):
+        # Get the event start time
+        start = event['start'].get('dateTime', event['start'].get('date'))
+        # Parse and format the event time
+        event_time = dateparser.parse(start).astimezone(local_tz).strftime('%H:%M')
+        # Get the event summary or title
+        summary = event.get('summary', 'No Title')
+        message += f"{idx}. {summary} at {event_time}\n"
 
     await update.message.reply_text(message)
 
@@ -672,7 +868,7 @@ async def handle_set_habits(update: Update, context: ContextTypes.DEFAULT_TYPE):
             scheduler.add_job(
                 create_habit_event,
                 trigger=trigger,
-                args=[habit_description, habit_time, duration_minutes],
+                args=[habit_description, duration_minutes],
                 id=f"habit_event_{habit_description}_{freq}"
             )
 
@@ -681,55 +877,68 @@ async def handle_set_habits(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ An error occurred while setting the habit.")
 
 # Function to create habit event in Google Calendar
-async def create_habit_event(habit_description, habit_time, duration_minutes):
+async def create_habit_event(habit_description: str, duration: int):
+    """Create a habit event in Calendar and Sheets."""
     try:
         service = get_calendar_service()
-        local_tz = pytz.timezone('Asia/Kuala_Lumpur')  # Replace with your timezone
-
+        local_tz = pytz.timezone('Asia/Kuala_Lumpur')
         now = datetime.now(local_tz)
-        event_datetime = now.replace(hour=habit_time.hour, minute=habit_time.minute, second=0, microsecond=0)
-        if event_datetime < now:
-            event_datetime += timedelta(days=1)
-
+        
+        # Create calendar event
         event = {
             'summary': habit_description,
             'start': {
-                'dateTime': event_datetime.isoformat(),
+                'dateTime': now.isoformat(),
                 'timeZone': str(local_tz),
             },
             'end': {
-                'dateTime': (event_datetime + timedelta(minutes=duration_minutes)).isoformat(),
+                'dateTime': (now + timedelta(minutes=duration)).isoformat(),
                 'timeZone': str(local_tz),
             },
         }
+        
         created_event = service.events().insert(calendarId='primary', body=event).execute()
         event_id = created_event.get('id')
 
-        # Log the event in Google Sheets
-        sheet = get_google_sheet('HabitsEvents')  # Ensure you have a 'HabitsEvents' sheet
-        sheet.append_row([habit_description, 'Pending', event_datetime.strftime('%Y-%m-%d'), event_datetime.strftime('%H:%M'), event_id])
+        # Log in Google Sheets
+        sheets_service = get_sheets_service()
+        values = [[
+            habit_description,
+            'Pending',
+            now.strftime('%Y-%m-%d'),
+            now.strftime('%H:%M'),
+            event_id
+        ]]
 
-        # Schedule a reminder to check habit completion
-        reminder_time = event_datetime + timedelta(minutes=duration_minutes)
+        sheets_service.spreadsheets().values().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range='Habits!A:E',
+            valueInputOption='RAW',
+            body={'values': values}
+        ).execute()
+
+        # Schedule completion check
+        reminder_time = now + timedelta(minutes=duration)
         scheduler.add_job(
             send_habit_check,
             trigger='date',
             run_date=reminder_time,
-            args=[event_id, habit_description],
-            id=f"habit_reminder_{event_id}"
+            args=[habit_description, event_id],
+            id=f"habit_check_{event_id}"
         )
+
+        logger.info(f"Created habit event: {habit_description}")
 
     except Exception as e:
         logger.error(f"Error creating habit event: {e}")
 
 # Function to send habit check
-async def send_habit_check(event_id, habit_description):
-    sheet = get_google_sheet('HabitsEvents')
-    events = sheet.get_all_records()
-    event = next((e for e in events if e['Event ID'] == event_id), None)
-
-    if not event:
-        logger.warning(f"Habit event with ID {event_id} not found.")
+async def send_habit_check(habit_description: str, event_id: str):
+    """Send a message to check if a habit was completed."""
+    global USER_CHAT_ID, application
+    
+    if not USER_CHAT_ID:
+        logger.error("No chat ID available. Make sure to run /start first.")
         return
 
     keyboard = [
@@ -739,44 +948,77 @@ async def send_habit_check(event_id, habit_description):
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await application.bot.send_message(
-        chat_id=YOUR_TELEGRAM_CHAT_ID,  # Replace with your actual Telegram chat ID
-        text=f"Did you complete the habit '{habit_description}'?",
-        reply_markup=reply_markup
-    )
+
+    try:
+        await application.bot.send_message(
+            chat_id=USER_CHAT_ID,
+            text=f"Did you complete the habit '{habit_description}'?",
+            reply_markup=reply_markup
+        )
+        logger.info(f"Sent habit check for: {habit_description}")
+    except Exception as e:
+        logger.error(f"Error sending habit check: {e}")
 
 # Callback handler for habit response
 async def handle_habit_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle user's response to habit completion check."""
     query = update.callback_query
     await query.answer()
-    data = query.data.split('|')
-    if len(data) != 2:
-        await query.edit_message_text("❌ Invalid response.")
+    
+    try:
+        status, event_id = query.data.split('|')
+    except ValueError:
+        await query.edit_message_text("❌ Invalid response format.")
         return
 
-    status, event_id = data
-    sheet = get_google_sheet('HabitsEvents')
+    try:
+        # Get sheet data
+        sheets_service = get_sheets_service()
+        result = sheets_service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range='Habits!A:E'
+        ).execute()
+        values = result.get('values', [])
 
-    # Find the event row
-    events = sheet.get_all_records()
-    row_number = None
-    for idx, record in enumerate(events, start=2):
-        if record['Event ID'] == event_id:
-            row_number = idx
-            break
+        if not values:
+            await query.edit_message_text("❌ No habits found in sheet.")
+            return
 
-    if not row_number:
-        await query.edit_message_text("❌ Habit event not found in the sheet.")
-        return
+        # Find the habit row
+        headers = values[0]
+        row_number = None
+        habit_description = None
 
-    if status == "habit_done":
-        sheet.update_cell(row_number, 2, 'Done')
-        await query.edit_message_text(f"✅ Habit '{events[row_number - 2]['Habit Description']}' marked as Done!")
-    elif status == "habit_missed":
-        sheet.update_cell(row_number, 2, 'Missed')
-        await query.edit_message_text(f"❌ Habit '{events[row_number - 2]['Habit Description']}' marked as Missed!")
-    else:
-        await query.edit_message_text("❌ Unknown status.")
+        for idx, row in enumerate(values[1:], start=2):
+            row_dict = dict(zip(headers, row))
+            if row_dict.get('Event ID') == event_id:
+                row_number = idx
+                habit_description = row_dict.get('Habit Description')
+                break
+
+        if not row_number:
+            await query.edit_message_text("❌ Habit not found in records.")
+            return
+
+        # Update status
+        new_status = 'Done' if status == "habit_done" else 'Missed'
+        sheets_service.spreadsheets().values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f'Habits!B{row_number}',
+            valueInputOption='RAW',
+            body={'values': [[new_status]]}
+        ).execute()
+
+        # Confirm update
+        emoji = "✅" if new_status == "Done" else "❌"
+        await query.edit_message_text(
+            f"{emoji} Habit '{habit_description}' marked as {new_status}!"
+        )
+        logger.info(f"Updated habit status: {habit_description} -> {new_status}")
+
+    except Exception as e:
+        logger.error(f"Error handling habit response: {e}")
+        await query.edit_message_text("❌ An error occurred while updating the habit.")
 
 # Command: /habitcheck
 async def habit_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -791,7 +1033,7 @@ async def habit_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     for habit in todays_habits:
-        await send_habit_check(habit['Event ID'], habit['Habit Description'])
+        await send_habit_check(habit['Habit Description'], habit['Event ID'])
 
 # Define states
 CONFIRMATION = 1
@@ -825,9 +1067,83 @@ def register_handlers(application):
     # Error handler
     application.add_error_handler(error_handler)
 
+# Define habits configuration
+HABITS = [
+    # Daily Morning Routine
+    {
+        'description': 'Morning Routine: Wake up, brush teeth, wash face, get ready',
+        'time': '07:00',
+        'duration': 30,  # Duration in minutes
+        'frequency': 'daily',
+    },
+    # Daily Evening Routine
+    {
+        'description': 'Evening Routine: Bath, meditate, devotion, reflection',
+        'time': '19:00',
+        'duration': 60,
+        'frequency': 'daily',
+    },
+    # Gym on Tuesday, Thursday, Saturday
+    {
+        'description': 'Gym Workout',
+        'time': '20:00',
+        'duration': 90,
+        'frequency': 'tuesday,thursday,saturday',
+    },
+    # Basketball on Wednesday
+    {
+        'description': 'Basketball Game',
+        'time': '20:00',
+        'duration': 90,
+        'frequency': 'wednesday',
+    },
+]
+
+def schedule_habits():
+    """Schedule all predefined habits."""
+    local_tz = pytz.timezone('Asia/Kuala_Lumpur')
+    days_map = {
+        'monday': 'mon', 'tuesday': 'tue', 'wednesday': 'wed',
+        'thursday': 'thu', 'friday': 'fri', 'saturday': 'sat',
+        'sunday': 'sun'
+    }
+
+    for habit in HABITS:
+        frequencies = [freq.strip().lower() for freq in habit['frequency'].split(',')]
+        for freq in frequencies:
+            if freq == 'daily':
+                day_of_week = 'mon,tue,wed,thu,fri,sat,sun'
+            elif freq in days_map:
+                day_of_week = days_map[freq]
+            else:
+                logger.warning(f"Unknown frequency: {freq}")
+                continue
+
+            time_parsed = dateparser.parse(habit['time'])
+            habit_time = time_parsed.time()
+            
+            # Create cron trigger
+            trigger = CronTrigger(
+                day_of_week=day_of_week,
+                hour=habit_time.hour,
+                minute=habit_time.minute,
+                timezone=local_tz
+            )
+
+            # Schedule the habit with correct arguments
+            scheduler.add_job(
+                create_habit_event,
+                trigger=trigger,
+                args=[habit['description'], habit['duration']],  # Pass both required arguments
+                id=f"habit_{habit['description']}_{freq}",
+                replace_existing=True
+            )
+            logger.info(f"Scheduled habit: {habit['description']} for {freq} at {habit['time']}")
+
 # Main function to start the bot
 if __name__ == '__main__':
     application = Application.builder().token(TOKEN).build()
     register_handlers(application)
+    schedule_habits()
+    logger.info("Habits scheduled successfully")
     application.run_polling()
-
