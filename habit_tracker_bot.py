@@ -14,12 +14,18 @@ from datetime import datetime, timedelta
 import pytz
 import re
 import calendar
-from config import get_sheets_service, SCOPES
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.date import DateTrigger
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from google.auth.transport.requests import Request
+from typing import Optional
 
 # Load environment variables from .env file
 load_dotenv()
 
-# Enable logging
+# Enable logging (Set to DEBUG for detailed logs)
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO  # Change to DEBUG for more detailed logs
@@ -27,14 +33,81 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Get the bot token and spreadsheet ID from the environment variables
-TOKEN = os.getenv('HABIT_TRACKER_BOT_TOKEN')
-SPREADSHEET_ID = os.getenv('SPREADSHEET_ID')
+TOKEN = os.getenv('HABIT_TRACKER_BOT_TOKEN')  # Ensure this is set correctly
+SPREADSHEET_ID = os.getenv('SPREADSHEET_ID')  # Ensure this is set correctly
 
 if not TOKEN:
-    raise ValueError("No token provided. Set the HABIT_TRACKER_BOT_TOKEN environment variable.")
+    raise ValueError("No token provided. Set the TELEGRAM_BOT_TOKEN environment variable.")
 
 if not SPREADSHEET_ID:
     raise ValueError("No spreadsheet ID provided. Set the SPREADSHEET_ID environment variable.")
+
+# Define the scopes for Google APIs
+SCOPES = [
+    'https://www.googleapis.com/auth/calendar.events',
+    'https://www.googleapis.com/auth/spreadsheets'
+]
+
+# Initialize APScheduler
+scheduler = AsyncIOScheduler(timezone='Asia/Kuala_Lumpur')  # Replace with your timezone
+scheduler.start()
+
+# Initialize the application globally
+application = None
+
+def get_credentials():
+    """Get and refresh Google OAuth2 credentials."""
+    try:
+        creds = None
+        if os.path.exists('token.json'):
+            try:
+                creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+                logger.info("Loaded existing credentials from token.json")
+            except Exception as e:
+                logger.error(f"Error loading token.json: {e}")
+                os.remove('token.json')
+                logger.info("Removed invalid token.json")
+
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                logger.info("Refreshing expired credentials")
+                creds.refresh(Request())
+            else:
+                if not os.path.exists('credentials.json'):
+                    raise FileNotFoundError("credentials.json not found")
+
+                logger.info("Initiating new OAuth flow")
+                flow = InstalledAppFlow.from_client_secrets_file(
+                    'credentials.json',
+                    SCOPES
+                )
+                creds = flow.run_local_server(
+                    port=0,
+                    access_type='offline',
+                    prompt='consent'
+                )
+
+            logger.info("Saving new credentials to token.json")
+            with open('token.json', 'w') as token:
+                token.write(creds.to_json())
+
+        return creds
+
+    except Exception as e:
+        logger.error(f"Error in get_credentials: {e}")
+        raise
+
+def get_sheets_service():
+    """Initialize Google Sheets API service."""
+    creds = get_credentials()
+    service = build('sheets', 'v4', credentials=creds)
+    return service
+
+def get_calendar_service():
+    """Initialize Google Calendar API service."""
+    creds = get_credentials()
+    service = build('calendar', 'v3', credentials=creds)
+    return service
 
 # Define your habits
 HABITS = [
@@ -60,7 +133,7 @@ HABITS = [
         'description': 'Gym Workout',
         'time': '20:00',
         'duration': 90,
-        'frequency': 'monday,thursday,saturday',
+        'frequency': 'tuesday,thursday,saturday',
     },
     {
         'description': 'Basketball Game',
@@ -72,6 +145,9 @@ HABITS = [
 
 # Global dictionary to store user chat IDs (supports multiple users)
 USER_CHAT_IDS = {}
+
+# Define states for ConversationHandler
+CONFIRMATION = 1
 
 # Error handler
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -117,9 +193,122 @@ async def set_habits(update: Update, context: ContextTypes.DEFAULT_TYPE):
         habits_info += f"- {habit['description']} ({freq_info})\n"
     await update.message.reply_text(habits_info)
 
-# Function to schedule habits using JobQueue
-def schedule_habits(app: Application):
-    """Schedule habits based on their frequency and time using JobQueue."""
+# Helper function to find the row number of a habit in Google Sheets
+def get_habit_row(sheets_service, habit_description, date_str):
+    """Find the row number of a habit in Google Sheets based on description and date."""
+    try:
+        result = sheets_service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range='Habits!A:E'
+        ).execute()
+        values = result.get('values', [])
+
+        if not values or len(values) < 2:
+            return None
+
+        headers = values[0]
+        for idx, row in enumerate(values[1:], start=2):
+            row_dict = dict(zip(headers, row))
+            if (row_dict.get('Habit Description', '').lower() == habit_description.lower() and
+                    row_dict.get('Date', '') == date_str):
+                return idx
+
+        return None
+    except Exception as e:
+        logger.error(f"Error in get_habit_row: {e}")
+        return None
+
+# Function to create habit event
+async def create_habit_event(habit_description: str, duration: int):
+    """Create a habit event in Google Calendar and log it in Google Sheets."""
+    logger.info(f"Executing create_habit_event for '{habit_description}' with duration {duration} minutes.")
+    try:
+        service = get_calendar_service()
+        sheets_service = get_sheets_service()
+        local_tz = pytz.timezone('Asia/Kuala_Lumpur')
+        now = datetime.now(local_tz)
+
+        # Create Google Calendar event
+        event = {
+            'summary': habit_description,
+            'start': {
+                'dateTime': now.isoformat(),
+                'timeZone': str(local_tz),
+            },
+            'end': {
+                'dateTime': (now + timedelta(minutes=duration)).isoformat(),
+                'timeZone': str(local_tz),
+            },
+        }
+
+        created_event = service.events().insert(calendarId='primary', body=event).execute()
+        event_id = created_event.get('id')
+        logger.info(f"Created Google Calendar event '{habit_description}' with ID {event_id}.")
+
+        # Log the habit in Google Sheets
+        values = [[
+            habit_description,
+            'Pending',
+            now.strftime('%Y-%m-%d'),
+            now.strftime('%H:%M'),
+            event_id
+        ]]
+
+        sheets_service.spreadsheets().values().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range='Habits!A:E',
+            valueInputOption='RAW',
+            body={'values': values}
+        ).execute()
+        logger.info(f"Logged habit '{habit_description}' in Google Sheets.")
+
+        # Schedule a reminder to check habit completion
+        reminder_time = now + timedelta(minutes=duration + 30)
+        reminder_job_id = f"habit_check_{event_id}"
+
+        scheduler.add_job(
+            send_habit_check,
+            trigger=DateTrigger(run_date=reminder_time),
+            args=[habit_description, event_id],
+            id=reminder_job_id,
+            coalesce=True,  # Prevent overlapping jobs
+            misfire_grace_time=300  # 5 minutes grace period
+        )
+        logger.info(f"Scheduled habit check for '{habit_description}' at {reminder_time}.")
+
+    except Exception as e:
+        logger.error(f"Error in create_habit_event: {e}")
+
+# Function to send habit check
+async def send_habit_check(habit_description: str, event_id: str):
+    """Send a message to check if a habit was completed."""
+    global application
+    if not USER_CHAT_IDS:
+        logger.error("No chat IDs available. Make sure users have sent /start first.")
+        return
+
+    for user_id in USER_CHAT_IDS.values():
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Yes", callback_data=f"habit_done|{event_id}"),
+                InlineKeyboardButton("❌ No", callback_data=f"habit_missed|{event_id}")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        try:
+            await application.bot.send_message(
+                chat_id=user_id,
+                text=f"Did you complete the habit '{habit_description}' today?",
+                reply_markup=reply_markup
+            )
+            logger.info(f"Sent habit check for: {habit_description} to user {user_id}")
+        except Exception as e:
+            logger.error(f"Error sending habit check to user {user_id}: {e}")
+
+# Function to schedule habits two days in advance using APScheduler
+def schedule_habits_two_days_ahead(app: Application):
+    """Schedule habits two days in advance using APScheduler."""
     local_tz = pytz.timezone('Asia/Kuala_Lumpur')
     days_map = {
         'monday': 'mon',
@@ -130,6 +319,8 @@ def schedule_habits(app: Application):
         'saturday': 'sat',
         'sunday': 'sun'
     }
+
+    sheets_service = get_sheets_service()
 
     for habit in HABITS:
         frequencies = [freq.strip().lower() for freq in habit['frequency'].split(',')]
@@ -144,102 +335,66 @@ def schedule_habits(app: Application):
 
             habit_time = datetime.strptime(habit['time'], '%H:%M').time()
 
-            for day in days_of_week:
-                # Calculate next run time
-                now = datetime.now(local_tz)
-                current_weekday = now.weekday()  # Monday is 0
-                target_weekday = list(calendar.day_abbr).index(day.capitalize()[:3])  # e.g., 'mon' -> 0
-                days_ahead = (target_weekday - current_weekday) % 7
-                if days_ahead == 0 and now.time() > habit_time:
-                    # If the time has already passed today, schedule for next week
-                    days_ahead = 7
-                run_date = now + timedelta(days=days_ahead)
-                run_date = run_date.replace(hour=habit_time.hour, minute=habit_time.minute, second=0, microsecond=0)
+            # Schedule for the next two days
+            for day_offset in range(1, 3):
+                run_date = datetime.now(local_tz) + timedelta(days=day_offset)
+                target_weekday = run_date.weekday()  # Monday is 0
+                day_abbr = calendar.day_abbr[target_weekday].lower()
+
+                if day_abbr not in days_of_week:
+                    continue  # Skip if the day is not in the frequency
+
+                today_str = run_date.strftime('%Y-%m-%d')
+
+                # Check if the habit is already scheduled for this date
+                try:
+                    result = sheets_service.spreadsheets().values().get(
+                        spreadsheetId=SPREADSHEET_ID,
+                        range='Habits!A:E'
+                    ).execute()
+                    values = result.get('values', [])
+                    headers = values[0] if values else []
+                    habits_logged = [dict(zip(headers, row)) for row in values[1:]]
+                    already_scheduled = any(
+                        habit_logged.get('Habit Description', '').lower() == habit['description'].lower() and
+                        habit_logged.get('Date', '') == today_str
+                        for habit_logged in habits_logged
+                    )
+                except Exception as e:
+                    logger.error(f"Error fetching data from Google Sheets: {e}")
+                    continue  # Skip scheduling if there's an error
+
+                if already_scheduled:
+                    logger.info(f"Habit '{habit['description']}' already scheduled for {today_str}. Skipping.")
+                    continue  # Skip if already scheduled
 
                 # Schedule the habit event
-                app.job_queue.run_repeating(
-                    callback=create_habit_event,
-                    interval=timedelta(weeks=1),
-                    first=run_date,
-                    data=habit['description'],  # Use 'data' instead of 'context'
-                    name=f"habit_{habit['description']}_{day}"
-                )
-                logger.info(f"Scheduled habit '{habit['description']}' on {day.capitalize()} at {habit['time']}")
+                run_datetime = run_date.replace(hour=habit_time.hour, minute=habit_time.minute, second=0, microsecond=0)
+                job_id = f"habit_{habit['description']}_{today_str}"
 
-# Function to create habit event
-async def create_habit_event(context: ContextTypes.DEFAULT_TYPE):
-    """Create a habit event in Sheets and schedule a completion check."""
-    habit_description = context.job.data  # Access using 'data'
-    try:
-        local_tz = pytz.timezone('Asia/Kuala_Lumpur')
-        now = datetime.now(local_tz)
+                # Schedule the job only if it hasn't been scheduled yet
+                if not scheduler.get_job(job_id):
+                    scheduler.add_job(
+                        create_habit_event,
+                        trigger=DateTrigger(run_date=run_datetime),
+                        args=[habit['description'], habit['duration']],
+                        id=job_id,
+                        coalesce=True,  # Prevent overlapping jobs
+                        misfire_grace_time=300  # 5 minutes grace period
+                    )
+                    logger.info(f"Scheduled habit '{habit['description']}' for {today_str} at {habit['time']}")
 
-        # Log in Google Sheets
-        sheets_service = get_sheets_service()
-        values = [[
-            habit_description,
-            'Pending',
-            now.strftime('%Y-%m-%d'),
-            now.strftime('%H:%M'),
-            ''  # Event ID is optional for habits
-        ]]
-
-        sheets_service.spreadsheets().values().append(
-            spreadsheetId=SPREADSHEET_ID,
-            range='Habits!A:E',
-            valueInputOption='RAW',
-            body={'values': values}
-        ).execute()
-
-        # Retrieve the duration of the habit
-        habit = next((h for h in HABITS if h['description'] == habit_description), None)
-        habit_duration = habit['duration'] if habit else 30  # Default to 30 minutes if not found
-
-        # Schedule completion check 30 minutes after habit duration
-        reminder_time = now + timedelta(minutes=habit_duration + 30)
-        app = context.application  # Access the application instance
-
-        app.job_queue.run_once(
-            send_habit_check,
-            when=reminder_time,
-            data=habit_description,  # Use 'data' instead of 'context'
-            name=f"habit_check_{habit_description}_{now.strftime('%Y%m%d%H%M')}"
-        )
-
-        logger.info(f"Logged habit: {habit_description} at {now}")
-        logger.info(f"Scheduled habit check at {reminder_time}")
-
-    except Exception as e:
-        logger.error(f"Error logging habit event: {e}")
-
-# Function to send habit check
-async def send_habit_check(context: ContextTypes.DEFAULT_TYPE):
-    """Send a message to check if a habit was completed."""
-    habit_description = context.job.data  # Access using 'data'
-
-    # Assuming single-user bot. For multi-user, iterate through USER_CHAT_IDS
-    if not USER_CHAT_IDS:
-        logger.error("No chat IDs available. Make sure users have sent /start first.")
-        return
-
-    for user_id in USER_CHAT_IDS.values():
-        keyboard = [
-            [
-                InlineKeyboardButton("✅ Yes", callback_data=f"habit_done|{habit_description}"),
-                InlineKeyboardButton("❌ No", callback_data=f"habit_missed|{habit_description}")
-            ]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        try:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=f"Did you complete the habit '{habit_description}' today?",
-                reply_markup=reply_markup
-            )
-            logger.info(f"Sent habit check for: {habit_description} to user {user_id}")
-        except Exception as e:
-            logger.error(f"Error sending habit check to user {user_id}: {e}")
+    # Schedule a test habit 5 minutes from now
+    test_run_datetime = datetime.now(local_tz) + timedelta(minutes=5)
+    scheduler.add_job(
+        create_habit_event,
+        trigger=DateTrigger(run_date=test_run_datetime),
+        args=["Test Habit", 10],  # Description and duration
+        id="habit_Test_Habit_test_date",
+        coalesce=True,
+        misfire_grace_time=300
+    )
+    logger.info(f"Scheduled test habit 'Test Habit' for {test_run_datetime.strftime('%Y-%m-%d %H:%M:%S')}")
 
 # Callback handler for habit response
 async def handle_habit_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -254,7 +409,7 @@ async def handle_habit_response(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text("❌ Invalid response.")
             return
 
-        status, habit_description = data
+        status, event_id = data
 
         # Get Sheets service
         sheets_service = get_sheets_service()
@@ -282,16 +437,17 @@ async def handle_habit_response(update: Update, context: ContextTypes.DEFAULT_TY
 
         # Find the habit
         row_number = None
-        today_str = datetime.now(pytz.timezone('Asia/Kuala_Lumpur')).strftime('%Y-%m-%d')
-
-        for idx, record in enumerate(habits, start=2):
-            if (record.get('Habit Description', '').lower() == habit_description.lower() and
-                    record.get('Date', '') == today_str):
-                row_number = idx
+        habit_description = None
+        date_str = None
+        for record in habits:
+            if record.get('Event ID') == event_id:
+                habit_description = record.get('Habit Description')
+                date_str = record.get('Date')
+                row_number = get_habit_row(sheets_service, habit_description, date_str)
                 break
 
         if not row_number:
-            await query.edit_message_text("❌ Habit not found in today's records.")
+            await query.edit_message_text("❌ Habit not found in the sheet.")
             return
 
         # Update status
@@ -303,6 +459,12 @@ async def handle_habit_response(update: Update, context: ContextTypes.DEFAULT_TY
                 valueInputOption='RAW',
                 body={'values': [[new_status]]}
             ).execute()
+
+            # Cancel the reminder job if it exists
+            reminder_job_id = f"habit_check_{event_id}"
+            if scheduler.get_job(reminder_job_id):
+                scheduler.remove_job(reminder_job_id)
+                logger.info(f"Removed reminder job {reminder_job_id}")
 
             # Send confirmation
             emoji = "✅" if new_status == "Done" else "❌"
@@ -343,14 +505,14 @@ async def habit_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         for habit in todays_habits:
-            await send_habit_check_directly(habit['Habit Description'])
+            await send_habit_check_directly(habit['Habit Description'], habit['Event ID'])
 
     except Exception as e:
         logger.error(f"Error in /habitcheck: {e}")
         await update.message.reply_text("An unexpected error occurred. Please try again later.")
 
 # Helper function to send habit check directly
-async def send_habit_check_directly(habit_description: str):
+async def send_habit_check_directly(habit_description: str, event_id: str):
     """Send a habit check message directly."""
     if not USER_CHAT_IDS:
         logger.error("No chat IDs available. Make sure users have sent /start first.")
@@ -359,8 +521,8 @@ async def send_habit_check_directly(habit_description: str):
     for user_id in USER_CHAT_IDS.values():
         keyboard = [
             [
-                InlineKeyboardButton("✅ Yes", callback_data=f"habit_done|{habit_description}"),
-                InlineKeyboardButton("❌ No", callback_data=f"habit_missed|{habit_description}")
+                InlineKeyboardButton("✅ Yes", callback_data=f"habit_done|{event_id}"),
+                InlineKeyboardButton("❌ No", callback_data=f"habit_missed|{event_id}")
             ]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -396,8 +558,8 @@ if __name__ == '__main__':
     # Register handlers
     register_handlers(application)
 
-    # Schedule habits using JobQueue
-    schedule_habits(application)
+    # Schedule habits two days ahead using APScheduler
+    schedule_habits_two_days_ahead(application)
     logger.info("Habits scheduled successfully")
 
     logger.info("Starting the Habit Tracker Bot...")
